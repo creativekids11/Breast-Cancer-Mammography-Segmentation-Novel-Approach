@@ -564,14 +564,38 @@ def train(args):
             # apply adjustments
             adj = apply_clahe_gamma_np(x_uint8, clahe.detach().cpu().numpy(), gamma.detach().cpu().numpy())
             adj_t = torch.tensor(adj, dtype=torch.float32).unsqueeze(1).to(device)
-            adj_t = (adj_t - 0.5) / 0.5
+            adj_t = (adj_t - 0.5) / 0.5  # normalized to [-1,1]
 
             with torch.no_grad():
                 seg_p = torch.sigmoid(seg(adj_t))
 
-            # reward shaping: dice - 0.1 * bce
-            bce_loss = F.binary_cross_entropy(seg_p, y)
-            rewards = dice_per_sample(seg_p, y) - 0.1 * bce_loss.detach()
+            # per-sample BCE
+            bce_per_sample = F.binary_cross_entropy(seg_p, y, reduction='none').mean((1,2,3))
+            dice_vals = dice_per_sample(seg_p, y)  # B
+
+            # compute dullness penalty
+            adj_denorm = (adj_t * 0.5 + 0.5).squeeze(1)  # B x H x W in [0,1]
+            brightness = adj_denorm.view(B, -1).mean(1)   # B
+            contrast = adj_denorm.view(B, -1).std(1)     # B
+
+            if args.auto_dull_thresholds:
+                # compute batch-level threshold from original input brightness mean
+                batch_orig_brightness_mean = x_denorm.view(B, -1).mean(1).mean()  # scalar
+                brightness_thresh_eff = batch_orig_brightness_mean * args.brightness_target_factor
+            else:
+                brightness_thresh_eff = torch.tensor(args.brightness_threshold, device=device)
+
+            contrast_thresh_eff = torch.tensor(args.contrast_threshold, device=device)
+
+            bright_deficit = torch.clamp(brightness_thresh_eff - brightness, min=0.0)
+            contrast_deficit = torch.clamp(contrast_thresh_eff - contrast, min=0.0)
+            dull_penalty = args.brightness_penalty_weight * bright_deficit + args.contrast_penalty_weight * contrast_deficit
+            # ensure same device/type
+            dull_penalty = dull_penalty.to(device)
+
+            # reward shaping: dice - 0.1 * bce - dull_penalty
+            rewards = dice_vals - 0.1 * bce_per_sample.detach() - dull_penalty.detach()
+
             # normalize rewards across batch
             rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
             rewards = rewards.to(device)
@@ -598,6 +622,9 @@ def train(args):
                 writer.add_scalar("phase1/std_clahe", std[:,0].mean().item(), ep)
                 writer.add_scalar("phase1/entropy_bonus", entropy_bonus.item(), ep)
                 writer.add_scalar("phase1/hist_entropy_mean", entropy.mean().item(), ep)
+                writer.add_scalar("phase1/brightness_mean", brightness.mean().item(), ep)
+                writer.add_scalar("phase1/contrast_mean", contrast.mean().item(), ep)
+                writer.add_scalar("phase1/dull_penalty_mean", dull_penalty.mean().item(), ep)
                 # log history mean (real values)
                 writer.add_scalar("phase1/policy_history_mean", policy.history_buffer.mean().item(), ep)
 
@@ -655,8 +682,29 @@ def train(args):
             seg_loss = crit(seg_logits, y)
             seg_p = torch.sigmoid(seg_logits)
 
-            bce_loss = F.binary_cross_entropy(seg_p, y)
-            rewards = dice_per_sample(seg_p, y) - 0.1 * bce_loss.detach()
+            # per-sample BCE
+            bce_per_sample = F.binary_cross_entropy(seg_p, y, reduction='none').mean((1,2,3))
+            dice_vals = dice_per_sample(seg_p, y)
+
+            # compute dullness penalty
+            adj_denorm = (adj_t * 0.5 + 0.5).squeeze(1)  # B x H x W in [0,1]
+            brightness = adj_denorm.view(B, -1).mean(1)   # B
+            contrast = adj_denorm.view(B, -1).std(1)     # B
+
+            if args.auto_dull_thresholds:
+                batch_orig_brightness_mean = x_denorm.view(B, -1).mean(1).mean()
+                brightness_thresh_eff = batch_orig_brightness_mean * args.brightness_target_factor
+            else:
+                brightness_thresh_eff = torch.tensor(args.brightness_threshold, device=device)
+
+            contrast_thresh_eff = torch.tensor(args.contrast_threshold, device=device)
+
+            bright_deficit = torch.clamp(brightness_thresh_eff - brightness, min=0.0)
+            contrast_deficit = torch.clamp(contrast_thresh_eff - contrast, min=0.0)
+            dull_penalty = args.brightness_penalty_weight * bright_deficit + args.contrast_penalty_weight * contrast_deficit
+            dull_penalty = dull_penalty.to(device)
+
+            rewards = dice_vals - 0.1 * bce_per_sample.detach() - dull_penalty.detach()
             rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
             rewards = rewards.to(device)
 
@@ -684,6 +732,9 @@ def train(args):
                 writer.add_scalar("phase2/clahe_glcm_mean", glcm.mean().item(), ep)
                 writer.add_scalar("phase2/glrlm_mean", glrlm.mean().item(), ep)
                 writer.add_scalar("phase2/policy_history_mean", policy.history_buffer.mean().item(), ep)
+                writer.add_scalar("phase2/brightness_mean", brightness.mean().item(), ep)
+                writer.add_scalar("phase2/contrast_mean", contrast.mean().item(), ep)
+                writer.add_scalar("phase2/dull_penalty_mean", dull_penalty.mean().item(), ep)
 
             seg_loss_tot += seg_loss.item(); pol_loss_tot += pol_loss.item()
         print(f"[P2 Ep{ep}] SegLoss={seg_loss_tot/len(tr_loader):.4f} PolLoss={pol_loss_tot/len(tr_loader):.4f}")
@@ -712,4 +763,11 @@ if __name__=="__main__":
     p.add_argument("--clahe-bins",type=int,default=32)
     p.add_argument("--glcm-levels",type=int,default=16)
     p.add_argument("--phase1-clahe-only", action='store_true', help='Train Phase1 with CLAHE only (gamma fixed)')
+    # new dullness reward args:
+    p.add_argument("--brightness-threshold", type=float, default=0.25, help="Brightness threshold (0-1) below which penalty applies")
+    p.add_argument("--contrast-threshold", type=float, default=0.05, help="Contrast (std) threshold below which penalty applies")
+    p.add_argument("--brightness-penalty-weight", type=float, default=0.2, help="Weight of brightness deficit penalty")
+    p.add_argument("--contrast-penalty-weight", type=float, default=0.5, help="Weight of contrast deficit penalty")
+    p.add_argument("--auto-dull-thresholds", action='store_true', help="Auto compute brightness threshold from batch original images to avoid manual tuning")
+    p.add_argument("--brightness-target-factor", type=float, default=0.7, help="When auto thresholds enabled, multiply original mean brightness by this factor for target")
     args=p.parse_args(); os.makedirs(args.outdir,exist_ok=True); train(args)
