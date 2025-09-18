@@ -14,7 +14,6 @@ Changes vs original:
    GLCM + a simple GLRLM feature set for stronger texture descriptors.
  - Logging retained.
 """
-
 import argparse, os, cv2, numpy as np, pandas as pd
 from tqdm import tqdm
 import torch, torch.nn as nn, torch.nn.functional as F
@@ -23,7 +22,8 @@ from torch.utils.tensorboard import SummaryWriter
 import segmentation_models_pytorch as smp
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from skimage.feature import local_binary_pattern, greycomatrix, greycoprops
+from skimage.feature import local_binary_pattern, graycomatrix, graycoprops
+from math import pi
 
 # =========================================================
 # Dataset
@@ -293,8 +293,6 @@ def compute_lbp(x_tensor, P=8, R=1):
     except Exception:
         return torch.zeros((B, lbp_bins), dtype=torch.float32, device=device)
 
-from math import pi
-
 def compute_glcm_features(x_tensor, levels=8, distances=[1], angles=None):
     """Compute GLCM properties for each image.
     Returns tensor B x (num_props * num_angles)
@@ -307,12 +305,11 @@ def compute_glcm_features(x_tensor, levels=8, distances=[1], angles=None):
     out_list = []
     for i in range(B):
         img = (x_tensor[i].squeeze().cpu().numpy() * (levels-1)).astype(np.uint8)
-        # greycomatrix expects values 0..levels-1
         try:
-            glcm = greycomatrix(img, distances=distances, angles=angles, levels=levels, symmetric=True, normed=True)
+            glcm = graycomatrix(img, distances=distances, angles=angles, levels=levels, symmetric=True, normed=True)
             feats = []
             for p in props:
-                val = greycoprops(glcm, p)  # shape (len(distances), len(angles))
+                val = graycoprops(glcm, p)  # shape (len(distances), len(angles))
                 feats.append(val.flatten())
             feats = np.concatenate(feats, axis=0).astype(np.float32)
         except Exception:
@@ -320,9 +317,8 @@ def compute_glcm_features(x_tensor, levels=8, distances=[1], angles=None):
         out_list.append(torch.from_numpy(feats))
     return torch.stack(out_list, dim=0).to(device)  # B x (6*len(angles))
 
-
 def compute_glrlm_features(x_tensor, levels=8):
-    """Compute a few simple GLRLM-based features using horizontal runs only.
+    """Compute GLRLM-based features using horizontal + vertical runs.
     Produces 5 features per image: SRE, LRE, GLN, RLN, RP (approximations).
     """
     B = x_tensor.size(0)
@@ -331,34 +327,41 @@ def compute_glrlm_features(x_tensor, levels=8):
     for i in range(B):
         img = (x_tensor[i].squeeze().cpu().numpy() * (levels-1)).astype(np.uint8)
         H, W = img.shape
-        # build run-length counts per gray-level and run-length for horizontal direction
-        max_run = W
-        R = np.zeros((levels, max_run+1), dtype=np.float32)  # gray x runlength
-        total_runs = 0
-        for row in img:
-            curr = row[0]
-            run = 1
-            for pix in row[1:]:
-                if pix == curr:
-                    run += 1
-                else:
-                    R[curr, run] += 1
-                    total_runs += 1
-                    curr = pix
-                    run = 1
-            R[curr, run] += 1
-            total_runs += 1
+        max_run = max(H, W)
+        # helper: compute run-length matrix for given axis
+        def runs_in_direction(arr, axis):
+            if axis == 0:
+                arr_proc = arr.T
+            else:
+                arr_proc = arr
+            R = np.zeros((levels, max_run+1), dtype=np.float32)
+            total = 0
+            for row in arr_proc:
+                curr = row[0]
+                run = 1
+                for pix in row[1:]:
+                    if pix == curr:
+                        run += 1
+                    else:
+                        R[curr, run] += 1
+                        total += 1
+                        curr = pix
+                        run = 1
+                R[curr, run] += 1
+                total += 1
+            return R, total
+        R_h, th = runs_in_direction(img, axis=1)
+        R_v, tv = runs_in_direction(img, axis=0)
+        R = R_h + R_v
+        total_runs = th + tv
         if total_runs == 0:
-            feats_all.append(torch.zeros(5, dtype=torch.float32))
-            continue
-        # compute features
-        # Short Run Emphasis (SRE)
+            feats_all.append(torch.zeros(5, dtype=torch.float32)); continue
         runs = np.arange(max_run+1, dtype=np.float32)
         sre = (R / (runs[None, :]**2 + 1e-8)).sum() / total_runs
         lre = (R * (runs[None, :]**2)).sum() / total_runs
         gln = (R.sum(axis=1)**2).sum() / (R.sum() + 1e-8)
         rln = (R.sum(axis=0)**2).sum() / (R.sum() + 1e-8)
-        rp = total_runs / (H*W + 1e-8)
+        rp = total_runs / (H * W + 1e-8)
         feats = np.array([sre, lre, gln, rln, rp], dtype=np.float32)
         feats_all.append(torch.from_numpy(feats))
     return torch.stack(feats_all, dim=0).to(device)  # B x 5
@@ -421,6 +424,9 @@ class PolicyNetwork(nn.Module):
         return mean, std
 
     def update_history(self, actions):
+        """actions: either (B,2) real-valued scaled actions or (2,) single vector.
+           We store the batch-mean real actions in the ring buffer (as real values).
+        """
         if actions is None:
             return
         if actions.dim() == 2:
@@ -464,7 +470,13 @@ def train(args):
     seg.eval()
     [setattr(p, "requires_grad", False) for p in seg.parameters()]
 
-    policy = PolicyNetwork(hidden=128, history_len=args.history_len, lbp_P=args.lbp_p, clahe_hist_bins=args.clahe_bins).to(device)
+    # set realistic action ranges here:
+    clahe_min, clahe_max = 0.5, 4.0
+    gamma_min, gamma_max = 0.7, 2.5
+    mid_gamma = (gamma_min + gamma_max) / 2.0
+
+    policy = PolicyNetwork(hidden=128, history_len=args.history_len, lbp_P=args.lbp_p,
+                           clahe_hist_bins=args.clahe_bins, glcm_levels=args.glcm_levels).to(device)
     critic = ValueNetwork().to(device)
 
     policy_opt = torch.optim.Adam(policy.parameters(), lr=args.policy_lr)
@@ -472,7 +484,6 @@ def train(args):
     seg_opt = torch.optim.SGD(seg.parameters(), lr=args.seg_lr, momentum=0.9, weight_decay=1e-4, nesterov=True)
 
     crit = DiceBCELoss()
-    clahe_min, clahe_max, gamma_min, gamma_max = 0.1, 10.0, 0.1, 5.0
 
     def compute_histograms(x_tensor, bins=32, vmin=0.0, vmax=1.0):
         B = x_tensor.size(0)
@@ -511,7 +522,7 @@ def train(args):
 
             lbp = compute_lbp(x_denorm, P=args.lbp_p, R=1)  # B x (P+2)
 
-            glcm = compute_glcm_features(x_denorm, levels=args.glcm_levels)  # B x 24 (6 props * 4 angles)
+            glcm = compute_glcm_features(x_denorm, levels=args.glcm_levels)  # B x (6*angles)
             glrlm = compute_glrlm_features(x_denorm, levels=args.glcm_levels)  # B x 5
 
             stats = torch.cat([hist, entropy, lbp, glcm, glrlm], dim=1).float().to(device)
@@ -519,9 +530,7 @@ def train(args):
             # Policy + value
             mean, std = policy(obs, stats)
 
-            # If requested: Phase1 trains only CLAHE (gamma fixed). We will therefore
-            # construct a 1-dim distribution for the CLAHE action only so gradients
-            # only flow through the CLAHE output of the network.
+            # If requested: Phase1 trains only CLAHE (gamma fixed).
             if args.phase1_clahe_only:
                 mean_clahe = mean[:, [0]]  # B x 1
                 std_clahe = std[:, [0]]
@@ -529,23 +538,28 @@ def train(args):
                 z = dist.rsample()  # B x 1
                 logp = dist.log_prob(z).sum(1)
                 entropy_bonus = dist.entropy().sum(1).mean()
-                z_sig = torch.sigmoid(z)
-                # build full z_sig for history (gamma fixed to value mapping)
-                fixed_gamma = (1.0 - gamma_min) / (gamma_max - gamma_min)
-                z_sig_full = torch.cat([z_sig, torch.full((B,1), fixed_gamma, device=device)], dim=1)
-                policy.update_history(z_sig_full.detach())
+                z_sig = torch.sigmoid(z)  # in (0,1)
 
-                clahe = clahe_min + z_sig[:,0] * (clahe_max - clahe_min)
-                gamma = torch.full((B,), 1.0, device=device)  # fixed gamma
+                # scaled real actions
+                clahe = clahe_min + z_sig[:,0] * (clahe_max - clahe_min)  # B
+                gamma = torch.full((B,), mid_gamma, device=device)     # fixed midpoint gamma
+
+                # update policy history with real-valued scaled actions
+                actions_real = torch.stack([clahe, gamma], dim=1)  # B x 2
+                policy.update_history(actions_real.detach())
+
             else:
                 dist = torch.distributions.Normal(mean, std)
                 z = dist.rsample()  # B x 2
                 logp = dist.log_prob(z).sum(1)
                 entropy_bonus = dist.entropy().sum(1).mean()
                 z_sig = torch.sigmoid(z)
-                policy.update_history(z_sig.detach())
+                # scale to real world ranges
                 clahe = clahe_min + z_sig[:,0] * (clahe_max - clahe_min)
                 gamma = gamma_min + z_sig[:,1] * (gamma_max - gamma_min)
+                # update policy history with real-valued scaled actions
+                actions_real = torch.stack([clahe, gamma], dim=1)
+                policy.update_history(actions_real.detach())
 
             # apply adjustments
             adj = apply_clahe_gamma_np(x_uint8, clahe.detach().cpu().numpy(), gamma.detach().cpu().numpy())
@@ -555,8 +569,10 @@ def train(args):
             with torch.no_grad():
                 seg_p = torch.sigmoid(seg(adj_t))
 
+            # reward shaping: dice - 0.1 * bce
             bce_loss = F.binary_cross_entropy(seg_p, y)
-            rewards = dice_per_sample(seg_p, y) * 2 - bce_loss.detach()
+            rewards = dice_per_sample(seg_p, y) - 0.1 * bce_loss.detach()
+            # normalize rewards across batch
             rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
             rewards = rewards.to(device)
 
@@ -582,6 +598,7 @@ def train(args):
                 writer.add_scalar("phase1/std_clahe", std[:,0].mean().item(), ep)
                 writer.add_scalar("phase1/entropy_bonus", entropy_bonus.item(), ep)
                 writer.add_scalar("phase1/hist_entropy_mean", entropy.mean().item(), ep)
+                # log history mean (real values)
                 writer.add_scalar("phase1/policy_history_mean", policy.history_buffer.mean().item(), ep)
 
             tot_loss += loss.item(); tot_reward += rewards.mean().item()
@@ -624,10 +641,12 @@ def train(args):
             logp = dist.log_prob(z).sum(1)
             entropy_bonus = dist.entropy().sum(1).mean()
             z_sig = torch.sigmoid(z)
-            policy.update_history(z_sig.detach())
-
+            # scale to real world ranges and update history with real-valued actions
             clahe = clahe_min + z_sig[:,0] * (clahe_max - clahe_min)
             gamma = gamma_min + z_sig[:,1] * (gamma_max - gamma_min)
+            actions_real = torch.stack([clahe, gamma], dim=1)
+            policy.update_history(actions_real.detach())
+
             adj = apply_clahe_gamma_np(x_uint8, clahe.cpu().numpy(), gamma.cpu().numpy())
             adj_t = torch.tensor(adj).unsqueeze(1).to(device)
             adj_t = (adj_t - 0.5) / 0.5
@@ -637,7 +656,7 @@ def train(args):
             seg_p = torch.sigmoid(seg_logits)
 
             bce_loss = F.binary_cross_entropy(seg_p, y)
-            rewards = dice_per_sample(seg_p, y) * 2 - bce_loss.detach()
+            rewards = dice_per_sample(seg_p, y) - 0.1 * bce_loss.detach()
             rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
             rewards = rewards.to(device)
 
@@ -687,10 +706,10 @@ if __name__=="__main__":
     p.add_argument("--policy-lr",type=float,default=1e-4)
     p.add_argument("--policy-epochs",type=int,default=100)
     p.add_argument("--seg-lr",type=float,default=1e-5)
-    p.add_argument("--joint-epochs",type=int,default=20)
+    p.add_argument("--joint-epochs",type=int,default=35)
     p.add_argument("--history-len",type=int,default=4)
     p.add_argument("--lbp-p",type=int,default=8)
     p.add_argument("--clahe-bins",type=int,default=32)
-    p.add_argument("--glcm-levels",type=int,default=8)
+    p.add_argument("--glcm-levels",type=int,default=16)
     p.add_argument("--phase1-clahe-only", action='store_true', help='Train Phase1 with CLAHE only (gamma fixed)')
     args=p.parse_args(); os.makedirs(args.outdir,exist_ok=True); train(args)
