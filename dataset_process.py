@@ -298,31 +298,97 @@ def process_normal_images(normal_img_dir, mask_outdir, image_outdir, texture_cfg
 
 # ---------------- INBREAST (Roboflow YOLOv11) ---------------- #
 def yolo_to_mask_with_classes(label_path: str, img_shape: Tuple[int,int], class_map):
-    """Convert YOLOv11 labels to binary mask + class list."""
+    """
+    Convert YOLOv11 labels to binary mask + class list.
+    Handles:
+      - bbox lines:  class x_center y_center width height
+      - bbox+conf lines: class x y w h conf  (ignores conf)
+      - polygon lines: class x1 y1 x2 y2 x3 y3 ... (normalized coordinates)
+    Returns (mask, [unique_class_names])
+    """
     H, W = img_shape
     mask = np.zeros((H, W), dtype=np.uint8)
     classes = []
     if not os.path.exists(label_path):
         return mask, classes
+
     with open(label_path, "r") as f:
         lines = f.readlines()
+
     for line in lines:
         parts = line.strip().split()
         if len(parts) < 5:
+            # skip malformed / too short
             continue
-        cls_id, x_c, y_c, w, h = map(float, parts[:5])
-        cls_id = int(cls_id)
+        try:
+            cls_id = int(float(parts[0]))
+        except Exception:
+            # can't parse class id
+            continue
         cls_name = class_map.get(cls_id, f"class_{cls_id}")
+        # collect class, preserve uniqueness later
         classes.append(cls_name)
-        x_c, y_c, w, h = x_c * W, y_c * H, w * W, h * H
-        x1, y1 = int(x_c - w / 2), int(y_c - h / 2)
-        x2, y2 = int(x_c + w / 2), int(y_c + h / 2)
-        # clip to image
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(W-1, x2), min(H-1, y2)
-        if x2 > x1 and y2 > y1:
-            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
-    return mask, list(dict.fromkeys(classes))  # preserve order & unique
+
+        coords = [float(x) for x in parts[1:]]
+        # bbox (x_center, y_center, w, h)
+        if len(coords) == 4:
+            x_c, y_c, w_rel, h_rel = coords
+            x1 = int(round((x_c - w_rel / 2.0) * W))
+            y1 = int(round((y_c - h_rel / 2.0) * H))
+            x2 = int(round((x_c + w_rel / 2.0) * W))
+            y2 = int(round((y_c + h_rel / 2.0) * H))
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(W-1, x2), min(H-1, y2)
+            if x2 > x1 and y2 > y1:
+                cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+            continue
+        # bbox with conf (ignore last value)
+        if len(coords) == 5:
+            x_c, y_c, w_rel, h_rel = coords[:4]
+            x1 = int(round((x_c - w_rel / 2.0) * W))
+            y1 = int(round((y_c - h_rel / 2.0) * H))
+            x2 = int(round((x_c + w_rel / 2.0) * W))
+            y2 = int(round((y_c + h_rel / 2.0) * H))
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(W-1, x2), min(H-1, y2)
+            if x2 > x1 and y2 > y1:
+                cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+            continue
+        # polygon (x1 y1 x2 y2 x3 y3 ...)
+        if len(coords) >= 6 and (len(coords) % 2 == 0):
+            pts = []
+            for i in range(0, len(coords), 2):
+                x_rel = coords[i]; y_rel = coords[i+1]
+                # if coordinates are already absolute (rare), guard them:
+                if 0.0 <= x_rel <= 1.0 and 0.0 <= y_rel <= 1.0:
+                    x_px = int(round(x_rel * W))
+                    y_px = int(round(y_rel * H))
+                else:
+                    # assume absolute pixel coords if > 1.0
+                    x_px = int(round(x_rel))
+                    y_px = int(round(y_rel))
+                # clip
+                x_px = max(0, min(W-1, x_px))
+                y_px = max(0, min(H-1, y_px))
+                pts.append([x_px, y_px])
+            if len(pts) >= 3:
+                try:
+                    pts_np = np.array(pts, dtype=np.int32)
+                    cv2.fillPoly(mask, [pts_np], 255)
+                except Exception:
+                    # fallback: draw polygon edges as rectangle if something fails
+                    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+                    x1, x2 = max(0, min(xs)), min(W-1, max(xs))
+                    y1, y2 = max(0, min(ys)), min(H-1, max(ys))
+                    if x2 > x1 and y2 > y1:
+                        cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+            continue
+        # otherwise unknown format: skip
+        continue
+
+    # unique classes preserving order
+    unique_classes = list(dict.fromkeys(classes))
+    return mask, unique_classes
 
 def process_inbreast_roboflow_v11(base_dir, yaml_path, mask_outdir, image_outdir, texture_cfg):
     ensure_dir(mask_outdir); ensure_dir(image_outdir)
