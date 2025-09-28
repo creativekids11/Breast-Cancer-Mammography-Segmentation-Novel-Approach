@@ -3,10 +3,8 @@
 """
 Refactored script for breast cancer segmentation using advanced U-Net architectures.
 
-Includes fixes:
- - mask/image shape mismatch handling (resizes mask to image before augment).
- - robust UpACA lazy initialization to avoid encoder-channel mismatches.
- - dummy init forward pass after model creation (so optimizer sees all params).
+Scheduler change: use CosineAnnealingWarmRestarts with eta_min default 5e-8.
+We step the scheduler per train-batch for smooth cosine cycles + restarts.
 """
 from __future__ import annotations
 import argparse
@@ -147,7 +145,6 @@ def check_masks(args):
         fname = os.path.join(outdir, f"check_{i}.png")
         cv2.imwrite(fname, overlay)
     print(f"[INFO] Saved {n} mask checks to {outdir}")
-
 
 # ----------------------------
 # ACA block, UNet, ASPP, etc.
@@ -434,7 +431,8 @@ class Trainer:
         self.model.train()
         total_loss = 0.0
         pbar = tqdm(self.train_loader, desc=f"Train E{epoch}/{self.args.epochs}")
-        for imgs, masks in pbar:
+        n_batches = len(self.train_loader)
+        for batch_idx, (imgs, masks) in enumerate(pbar):
             imgs, masks = imgs.to(self.device), masks.to(self.device)
 
             self.optimizer.zero_grad()
@@ -451,12 +449,26 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
+            # Step the CosineAnnealingWarmRestarts scheduler every batch using fractional epoch
+            # (epoch starts at 1 in run loop, so fractional_epoch = epoch-1 + batch_idx/n_batches)
+            if self.scheduler is not None:
+                try:
+                    frac_epoch = float(epoch - 1) + float(batch_idx) / max(1, n_batches)
+                    # scheduler expects a float epoch value to compute internal T_cur when stepping per-batch
+                    self.scheduler.step(frac_epoch)
+                except Exception:
+                    # some schedulers expect different stepping; ignore step failures gracefully
+                    pass
+
             total_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}", l1=f"{l1_penalty.item():.4f}")
 
         avg_loss = total_loss / len(self.train_loader)
         self.writer.add_scalar("train/loss", avg_loss, epoch)
-        print(f"Epoch {epoch} Train Loss: {avg_loss:.4f}")
+        # also log lr
+        current_lr = self.optimizer.param_groups[0]['lr']
+        self.writer.add_scalar("train/lr", current_lr, epoch)
+        print(f"Epoch {epoch} Train Loss: {avg_loss:.4f}, LR: {current_lr:.6e}")
 
     def _validate_epoch(self, epoch: int):
         self.model.eval()
@@ -480,11 +492,13 @@ class Trainer:
         avg_val_loss = val_loss / len(self.val_loader)
         avg_val_dice = val_dice / len(self.val_loader)
 
-        self.scheduler.step(avg_val_dice)
+        # NOTE: CosineAnnealingWarmRestarts is not metric-driven, so DO NOT call scheduler.step(metric).
+        # We already stepped the scheduler per-batch in training.
 
         self.writer.add_scalar("val/loss", avg_val_loss, epoch)
         self.writer.add_scalar("val/dice", avg_val_dice, epoch)
-        self.writer.add_scalar("lr", self.optimizer.param_groups[0]['lr'], epoch)
+        # still log LR so you can see lr vs metric
+        self.writer.add_scalar("val/lr", self.optimizer.param_groups[0]['lr'], epoch)
         print(f"Epoch {epoch} Val Loss: {avg_val_loss:.4f}, Val Dice: {avg_val_dice:.4f}")
 
         if avg_val_dice > self.best_val_dice:
@@ -534,7 +548,7 @@ def get_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train a segmentation model.")
     p.add_argument("--csv", type=str, required=True, help="Path to the training CSV file.")
     p.add_argument("--outdir", type=str, default="checkpoints", help="Directory to save model checkpoints.")
-    p.add_argument("--logdir", type=str, default="runs/segmentation_experiment", help="TensorBoard log directory.")
+    p.add_argument("--logdir", type=str, default="runs/segmentation_cascade", help="TensorBoard log directory.")
 
     # Dataset and DataLoader
     p.add_argument("--img-size", type=int, default=512, help="Image size for resizing.")
@@ -542,7 +556,7 @@ def get_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=4, help="DataLoader num_workers.")
 
     # Training Hyperparameters
-    p.add_argument("--epochs", type=int, default=75, help="Number of training epochs.")
+    p.add_argument("--epochs", type=int, default=125, help="Number of training epochs.")
     p.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
     p.add_argument("--pos-weight", type=float, default=12.0, help="Positive class weight for BCE loss.")
     p.add_argument("--l1-lambda", type=float, default=4.5e-4, help="L1 regularization strength.")
@@ -554,6 +568,11 @@ def get_args() -> argparse.Namespace:
 
     p.add_argument("--check-masks", action="store_true",
                help="Quickly save a few image+mask overlay PNGs to outdir/check_masks for visual inspection.")
+
+    # CosineAnnealingWarmRestarts options
+    p.add_argument("--t0", type=int, default=12, help="T_0 for CosineAnnealingWarmRestarts (first restart epoch count).")
+    p.add_argument("--t-mult", type=int, default=2, help="T_mult for CosineAnnealingWarmRestarts (cycle multiplier).")
+    p.add_argument("--eta-min", type=float, default=5e-8, help="Minimum LR (eta_min) for CosineAnnealingWarmRestarts.")
 
     return p.parse_args()
 
@@ -630,8 +649,13 @@ def main():
     # now create optimizer (after dummy pass so optimizer sees all params)
     criterion = DiceBCELoss(smooth=1e-5)
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4, nesterov=True)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True, min_lr=1e-6
+
+    # --- COSINE WARM RESTARTS SCHEDULER ---
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer,
+        T_0=args.t0,
+        T_mult=args.t_mult,
+        eta_min=args.eta_min
     )
 
     trainer = Trainer(
