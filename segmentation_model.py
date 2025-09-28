@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 # segmentation_model_refactored.py
 """
-Segmentation trainer, optimized to use the single-channel texture-enhanced images
-produced by prepare_dataset.py. Uses ACA-Atrous-ResUNet only and includes
-AMP (mixed precision), robust sampler, gradient accumulation, and logging.
+Refactored script for breast cancer segmentation using advanced U-Net architectures.
+
+Includes fixes:
+ - mask/image shape mismatch handling (resizes mask to image before augment).
+ - robust UpACA lazy initialization to avoid encoder-channel mismatches.
+ - dummy init forward pass after model creation (so optimizer sees all params).
 """
 from __future__ import annotations
 import argparse
 import os
 import random
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Any
 
 import cv2
 import numpy as np
@@ -32,38 +35,45 @@ import torchvision
 # ----------------------------
 class BreastSegDataset(Dataset):
     """
-    Expects CSV with `image_file_path` and `roi_mask_file_path`.
-    Input image is a single-channel texture-enhanced grayscale PNG produced by prepare_dataset.py.
+    Dataset that supports precomputed ROI columns in CSV:
+      roi_x1, roi_y1, roi_x2, roi_y2 (integers, optional).
+    If present, image and mask will be cropped to the ROI before transforms.
+    Returns (img_tensor, mask_tensor) if not using metas; if use_meta=True returns (img, mask, meta)
     """
-    def __init__(self, csv_file: str, resize: Tuple[int, int] = (512, 512), augment: bool = False):
+    def __init__(self, csv_file: str, resize: Tuple[int,int] = (512,512), augment: bool = False,
+                 use_meta: bool = False):
         df = pd.read_csv(csv_file)
-        self.images: List[str] = df["image_file_path"].tolist()
-        self.masks: List[str] = df["roi_mask_file_path"].tolist()
+        self.images = df["image_file_path"].tolist()
+        self.masks = df["roi_mask_file_path"].tolist()
+        # read roi columns if present (may be NaN)
+        self.roi_x1 = df["roi_x1"].tolist() if "roi_x1" in df.columns else [None]*len(df)
+        self.roi_y1 = df["roi_y1"].tolist() if "roi_y1" in df.columns else [None]*len(df)
+        self.roi_x2 = df["roi_x2"].tolist() if "roi_x2" in df.columns else [None]*len(df)
+        self.roi_y2 = df["roi_y2"].tolist() if "roi_y2" in df.columns else [None]*len(df)
         self.resize = resize
         self.augment = augment
+        self.use_meta = use_meta
         self.transform = self._get_transforms()
 
-    def _get_transforms(self) -> A.Compose:
-        # We resize first so Albumentations shape checks pass reliably
-        common = [
+    def _get_transforms(self):
+        common_transforms = [
             A.Resize(self.resize[0], self.resize[1]),
             A.Normalize(mean=(0.5,), std=(0.5,)),
             ToTensorV2()
         ]
         if self.augment:
-            aug = [
+            aug_transforms = [
                 A.HorizontalFlip(p=0.5),
                 A.VerticalFlip(p=0.5),
                 A.Rotate(limit=20, p=0.5),
                 A.RandomBrightnessContrast(p=0.2),
-                *common
+                *common_transforms
             ]
-            # keep shape checks on (should be consistent because of Resize)
-            return A.Compose(aug, additional_targets={"mask": "mask"})
+            return A.Compose(aug_transforms, additional_targets={"mask":"mask"})
         else:
-            return A.Compose(common, additional_targets={"mask": "mask"})
+            return A.Compose(common_transforms, additional_targets={"mask":"mask"})
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self.images)
 
     def __getitem__(self, idx: int):
@@ -71,45 +81,105 @@ class BreastSegDataset(Dataset):
         mask_path = self.masks[idx]
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-
         if img is None:
             raise RuntimeError(f"Failed to read image: {img_path}")
         if mask is None:
             raise RuntimeError(f"Failed to read mask: {mask_path}")
 
-        mask = (mask > 0).astype(np.uint8) * 255  # ensure binary 0/255
+        H,W = img.shape[:2]
+        # check precomputed ROI columns
+        try:
+            x1 = None if self.roi_x1[idx] is None or (isinstance(self.roi_x1[idx], float) and np.isnan(self.roi_x1[idx])) else int(self.roi_x1[idx])
+            y1 = None if self.roi_y1[idx] is None or (isinstance(self.roi_y1[idx], float) and np.isnan(self.roi_y1[idx])) else int(self.roi_y1[idx])
+            x2 = None if self.roi_x2[idx] is None or (isinstance(self.roi_x2[idx], float) and np.isnan(self.roi_x2[idx])) else int(self.roi_x2[idx])
+            y2 = None if self.roi_y2[idx] is None or (isinstance(self.roi_y2[idx], float) and np.isnan(self.roi_y2[idx])) else int(self.roi_y2[idx])
+        except Exception:
+            x1=y1=x2=y2=None
 
-        augmented = self.transform(image=img, mask=mask)
-        img_t = augmented["image"]          # 1 x H x W, normalized (-1..1)
-        mask_t = augmented["mask"].unsqueeze(0).float() / 255.0  # 1 x H x W (0/1)
+        if x1 is not None and x2 is not None and y1 is not None and y2 is not None:
+            # clamp
+            x1 = max(0, min(W-1, x1)); x2 = max(0, min(W-1, x2))
+            y1 = max(0, min(H-1, y1)); y2 = max(0, min(H-1, y2))
+            if x2 < x1: x2 = x1
+            if y2 < y1: y2 = y1
+            img_crop = img[y1:y2+1, x1:x2+1]
+            mask_crop = mask[y1:y2+1, x1:x2+1]
+            meta = ((H,W), (x1,y1,x2,y2), None, None)  # you may populate lesion_norm later
+        else:
+            img_crop = img
+            mask_crop = mask
+            meta = None
 
-        return img_t.float(), mask_t.float()
+        # ensure binary mask
+        if mask_crop is None:
+            mask_crop = np.zeros_like(img_crop, dtype=np.uint8)
+        if mask_crop.shape != img_crop.shape:
+            mask_crop = cv2.resize(mask_crop, (img_crop.shape[1], img_crop.shape[0]), interpolation=cv2.INTER_NEAREST)
+        mask_crop = ((mask_crop > 0).astype(np.uint8) * 255)
+
+        augmented = self.transform(image=img_crop, mask=mask_crop)
+        img_t = augmented["image"]
+        mask_t = augmented["mask"].unsqueeze(0) / 255.0
+
+        if self.use_meta:
+            return img_t.float(), mask_t.float(), meta
+        else:
+            return img_t.float(), mask_t.float()
+
+def check_masks(args):
+    """Save a small set of image+mask overlay checks for quick visual sanity check."""
+    ds = BreastSegDataset(args.csv, resize=(args.img_size, args.img_size), augment=False)
+    outdir = os.path.join(args.outdir, "check_masks")
+    os.makedirs(outdir, exist_ok=True)
+    n = min(32, len(ds))
+    for i in range(n):
+        img_t, mask_t = ds[i]
+        # tensors: img_t is 1xHxW normalized (-1..1) after ToTensorV2 + Normalize
+        # Undo normalization to view: (img*0.5 + 0.5) *255
+        img = img_t.clone()
+        img = img * 0.5 + 0.5
+        img = (img * 255.0).squeeze(0).cpu().numpy().astype(np.uint8)
+        mask = (mask_t.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)
+        # overlay contour
+        overlay = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(overlay, contours, -1, (0,0,255), 1)  # red contours
+        fname = os.path.join(outdir, f"check_{i}.png")
+        cv2.imwrite(fname, overlay)
+    print(f"[INFO] Saved {n} mask checks to {outdir}")
+
 
 # ----------------------------
-# ACA block, UNet pieces, and ACAAtrousResUNet (unchanged but included)
+# ACA block, UNet, ASPP, etc.
 # ----------------------------
 class ACAModule(nn.Module):
     def __init__(self, skip_channels, gate_channels, reduction=8):
+        """
+        Standard ACA module. Keep init with provided channel hints, but robust
+        usage in UpACA (we will create instances with correct channels).
+        """
         super().__init__()
+        # We'll assume channels provided are correct for normal (non-lazy) cases.
         self.ca = nn.Sequential(
-            nn.Conv2d(skip_channels + gate_channels, max(skip_channels // reduction,1), kernel_size=1, bias=False),
+            nn.Conv2d(skip_channels + gate_channels, max(skip_channels // reduction, 1), kernel_size=1, bias=False),
             nn.ReLU(inplace=True),
-            nn.Conv2d(max(skip_channels // reduction,1), skip_channels, kernel_size=1, bias=False),
+            nn.Conv2d(max(skip_channels // reduction, 1), skip_channels, kernel_size=1, bias=False),
             nn.Sigmoid()
         )
         self.spatial = nn.Sequential(
-            nn.Conv2d(skip_channels + gate_channels, max(skip_channels // reduction,1), kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(skip_channels + gate_channels, max(skip_channels // reduction, 1), kernel_size=3, padding=1, bias=False),
             nn.ReLU(inplace=True),
-            nn.Conv2d(max(skip_channels // reduction,1), 1, kernel_size=1),
+            nn.Conv2d(max(skip_channels // reduction, 1), 1, kernel_size=1),
             nn.Sigmoid()
         )
         self.fuse = nn.Sequential(
             nn.Conv2d(skip_channels, skip_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(skip_channels), nn.ReLU(inplace=True)
+            nn.BatchNorm2d(skip_channels),
+            nn.ReLU(inplace=True)
         )
+
     def forward(self, skip, gate):
-        if gate.shape[2:] != skip.shape[2:]:
-            gate = F.interpolate(gate, size=skip.shape[2:], mode='bilinear', align_corners=False)
+        # gate already resized where needed by caller
         concat = torch.cat([skip, gate], dim=1)
         ca = self.ca(concat)
         sa = self.spatial(concat)
@@ -121,25 +191,83 @@ class DoubleConv(nn.Module):
         super().__init__()
         layers = [
             nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels), nn.ReLU(inplace=True)
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
         ]
         if dropout:
             layers.append(nn.Dropout2d(0.3))
         self.net = nn.Sequential(*layers)
-    def forward(self, x): return self.net(x)
+    def forward(self, x):
+        return self.net(x)
 
-class UpACA(nn.Module):
-    def __init__(self, in_ch, out_ch, skip_ch, dropout=False):
+class Down(nn.Module):
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.aca = ACAModule(skip_channels=skip_ch, gate_channels=in_ch)
+        self.pool = nn.MaxPool2d(2)
+        self.conv = DoubleConv(in_ch, out_ch)
+    def forward(self, x): return self.conv(self.pool(x))
+
+class Up(nn.Module):
+    def __init__(self, in_ch, out_ch, skip_ch, bilinear=True, dropout=False):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False) if bilinear else nn.ConvTranspose2d(in_ch, in_ch, kernel_size=2, stride=2)
         self.conv = DoubleConv(skip_ch + in_ch, out_ch, dropout=dropout)
     def forward(self, x_decoder, x_encoder):
         x = self.up(x_decoder)
         if x.shape[2:] != x_encoder.shape[2:]:
             x = F.interpolate(x, size=x_encoder.shape[2:], mode='bilinear', align_corners=False)
+        out = torch.cat([x_encoder, x], dim=1)
+        return self.conv(out)
+
+class UpACA(nn.Module):
+    """
+    Robust Up module with ACA. Lazily creates internal modules and moves them
+    to the same device/dtype as the tensors that triggered creation.
+    """
+    def __init__(self, in_ch_hint=None, out_ch=64, skip_ch_hint=None, dropout=False):
+        super().__init__()
+        self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self._in_ch_hint = in_ch_hint
+        self._skip_ch_hint = skip_ch_hint
+        self._out_ch = out_ch
+        self._dropout = dropout
+        # actual modules (created lazily in forward)
+        self.aca = None
+        self.conv = None
+
+    def _create_modules(self, skip_ch, gate_ch, device=None, dtype=None):
+        # create ACA and conv with correct channel sizes
+        self.aca = ACAModule(skip_channels=skip_ch, gate_channels=gate_ch)
+        in_conv = skip_ch + gate_ch
+        self.conv = DoubleConv(in_conv, self._out_ch, dropout=self._dropout)
+
+        # Move newly created modules to the correct device/dtype
+        if device is not None:
+            # .to accepts dtype as well, ensure weights/biases match input dtype
+            if dtype is not None:
+                self.aca.to(device=device, dtype=dtype)
+                self.conv.to(device=device, dtype=dtype)
+            else:
+                self.aca.to(device)
+                self.conv.to(device)
+
+    def forward(self, x_decoder, x_encoder):
+        x = self.up(x_decoder)
+        if x.shape[2:] != x_encoder.shape[2:]:
+            x = F.interpolate(x, size=x_encoder.shape[2:], mode='bilinear', align_corners=False)
+
+        skip_ch = x_encoder.shape[1]
+        gate_ch = x.shape[1]
+
+        # If modules not yet created, create them and move to the data device/dtype
+        if self.aca is None or self.conv is None:
+            device = x_encoder.device
+            dtype = x_encoder.dtype
+            self._create_modules(skip_ch, gate_ch, device=device, dtype=dtype)
+
         skip_ref = self.aca(x_encoder, x)
         out = torch.cat([skip_ref, x], dim=1)
         return self.conv(out)
@@ -150,8 +278,11 @@ class ASPP(nn.Module):
         self.blocks = nn.ModuleList([nn.Conv2d(in_ch, out_ch, 3, padding=r, dilation=r, bias=False) for r in rates])
         self.bn = nn.BatchNorm2d(out_ch * len(rates))
         self.relu = nn.ReLU(inplace=True)
-        self.project = nn.Sequential(nn.Conv2d(out_ch * len(rates), out_ch, kernel_size=1, bias=False),
-                                     nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True))
+        self.project = nn.Sequential(
+            nn.Conv2d(out_ch * len(rates), out_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
     def forward(self, x):
         feats = [blk(x) for blk in self.blocks]
         x = torch.cat(feats, dim=1)
@@ -159,21 +290,94 @@ class ASPP(nn.Module):
         x = self.project(x)
         return x
 
+class ACAAtrousUNet(nn.Module):
+    def __init__(self, in_ch=1, out_ch=1, base_ch=64):
+        super().__init__()
+        self.inc = DoubleConv(in_ch, base_ch)
+        self.down1 = Down(base_ch, base_ch*2)
+        self.down2 = Down(base_ch*2, base_ch*4)
+        self.down3 = Down(base_ch*4, base_ch*8)
+        self.down4 = Down(base_ch*8, base_ch*8)
+        self.aspp = ASPP(base_ch*8, base_ch*2)
+        self.up1 = UpACA(in_ch_hint=base_ch*8, out_ch=base_ch*4, skip_ch_hint=base_ch*8, dropout=True)
+        self.up2 = UpACA(in_ch_hint=base_ch*4, out_ch=base_ch*2, skip_ch_hint=base_ch*4, dropout=True)
+        self.up3 = UpACA(in_ch_hint=base_ch*2, out_ch=base_ch, skip_ch_hint=base_ch*2, dropout=True)
+        self.up4 = UpACA(in_ch_hint=base_ch, out_ch=base_ch, skip_ch_hint=base_ch, dropout=True)
+        self.outc = nn.Conv2d(base_ch, out_ch, 1)
+    def forward(self, x):
+        x1 = self.inc(x)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        x5 = self.aspp(x5)
+        u1 = self.up1(x5, x4)
+        u2 = self.up2(u1, x3)
+        u3 = self.up3(u2, x2)
+        u4 = self.up4(u3, x1)
+        logits = self.outc(u4)
+        return F.interpolate(logits, size=x.shape[2:], mode='bilinear', align_corners=False)
+
+class UNet(nn.Module):
+    def __init__(self, in_ch=1, out_ch=1, base_ch=64):
+        super().__init__()
+        self.inc = DoubleConv(in_ch, base_ch)
+        self.down1 = Down(base_ch, base_ch*2)
+        self.down2 = Down(base_ch*2, base_ch*4)
+        self.down3 = Down(base_ch*4, base_ch*8)
+        self.down4 = Down(base_ch*8, base_ch*8)
+        self.up1 = Up(base_ch*8, base_ch*4, base_ch*8, dropout=True)
+        self.up2 = Up(base_ch*4, base_ch*2, base_ch*4, dropout=True)
+        self.up3 = Up(base_ch*2, base_ch, base_ch*2, dropout=True)
+        self.up4 = Up(base_ch, base_ch, base_ch, dropout=True)
+        self.outc = nn.Conv2d(base_ch, out_ch, 1)
+    def forward(self, x):
+        x1 = self.inc(x); x2 = self.down1(x1)
+        x3 = self.down2(x2); x4 = self.down3(x3)
+        x5 = self.down4(x4)
+        u1 = self.up1(x5, x4); u2 = self.up2(u1, x3)
+        u3 = self.up3(u2, x2); u4 = self.up4(u3, x1)
+        logits = self.outc(u4)
+        return F.interpolate(logits, size=x.shape[2:], mode='bilinear', align_corners=False)
+
+class ConnectUNets(nn.Module):
+    def __init__(self, in_ch=1, out_ch=1, base_ch=64):
+        super().__init__()
+        self.net1 = UNet(in_ch, out_ch, base_ch)
+        self.net2 = UNet(in_ch + out_ch, out_ch, base_ch)
+    def forward(self, x):
+        pred1 = torch.sigmoid(self.net1(x))
+        inp2 = torch.cat([x, pred1], dim=1)
+        pred2 = self.net2(inp2)
+        return pred2, pred1
+
 class ACAAtrousResUNet(nn.Module):
     def __init__(self, in_ch=1, out_ch=1):
         super().__init__()
         # SMP Unet encoder but we will only use this single architecture
         self.encoder = smp.Unet(encoder_name="resnet34", encoder_weights="imagenet", in_channels=in_ch, classes=out_ch)
         encoder_channels = self.encoder.encoder.out_channels
+        # aspp input/out chosen from encoder channel list
         self.aspp = ASPP(in_ch=encoder_channels[-1], out_ch=encoder_channels[-2])
-        self.up_aca1 = UpACA(in_ch=encoder_channels[-2], out_ch=encoder_channels[-3], skip_ch=encoder_channels[-2])
-        self.up_aca2 = UpACA(in_ch=encoder_channels[-3], out_ch=encoder_channels[-4], skip_ch=encoder_channels[-3])
-        self.up_aca3 = UpACA(in_ch=encoder_channels[-4], out_ch=encoder_channels[-5], skip_ch=encoder_channels[-4])
-        self.up_aca4 = UpACA(in_ch=encoder_channels[-5], out_ch=encoder_channels[-5], skip_ch=encoder_channels[-5])
+        # create UpACA with hints - UpACA will lazily create modules based on actual tensors
+        self.up_aca1 = UpACA(in_ch_hint=encoder_channels[-2], out_ch=encoder_channels[-3], skip_ch_hint=encoder_channels[-2])
+        self.up_aca2 = UpACA(in_ch_hint=encoder_channels[-3], out_ch=encoder_channels[-4], skip_ch_hint=encoder_channels[-3])
+        self.up_aca3 = UpACA(in_ch_hint=encoder_channels[-4], out_ch=encoder_channels[-5], skip_ch_hint=encoder_channels[-4])
+        self.up_aca4 = UpACA(in_ch_hint=encoder_channels[-5], out_ch=encoder_channels[-5], skip_ch_hint=encoder_channels[-5])
         self.outc = nn.Conv2d(in_channels=encoder_channels[-5], out_channels=out_ch, kernel_size=1)
+
     def forward(self, x):
+        # encoder.encoder returns list/tuple of features; indices may vary by SMP version.
         feats = self.encoder.encoder(x)
-        e1, e2, e3, e4, bottleneck = feats[1], feats[2], feats[3], feats[4], feats[5]
+        # Try to handle different lengths (some SMP versions include more initial feature)
+        # Common layout: feats = [c0, c1, c2, c3, c4, c5] or [c0,c1,c2,c3,c4]
+        # We'll attempt to pick last five features for decoder use.
+        if len(feats) >= 6:
+            e1, e2, e3, e4, bottleneck = feats[1], feats[2], feats[3], feats[4], feats[5]
+        else:
+            # fallback: use last 5 elements
+            e1, e2, e3, e4, bottleneck = feats[-5], feats[-4], feats[-3], feats[-2], feats[-1]
+
         d5 = self.aspp(bottleneck)
         d4 = self.up_aca1(d5, e4)
         d3 = self.up_aca2(d4, e3)
@@ -183,30 +387,33 @@ class ACAAtrousResUNet(nn.Module):
         return F.interpolate(logits, size=x.shape[2:], mode='bilinear', align_corners=False)
 
 # ----------------------------
-# Loss & helpers
+# Loss, Metrics & Regularization
 # ----------------------------
 class DiceBCELoss(nn.Module):
+    """Combined Dice and BCE loss for segmentation."""
     def __init__(self, smooth: float = 1e-5):
         super().__init__()
         self.smooth = smooth
-    def forward(self, inputs: torch.Tensor, targets: torch.Tensor, pos_weight: torch.Tensor):
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor, pos_weight: torch.Tensor) -> torch.Tensor:
         bce = F.binary_cross_entropy_with_logits(inputs, targets, pos_weight=pos_weight)
         inputs_sigmoid = torch.sigmoid(inputs).view(-1)
         targets_flat = targets.view(-1)
-        inter = (inputs_sigmoid * targets_flat).sum()
-        dice_score = (2. * inter + self.smooth) / (inputs_sigmoid.sum() + targets_flat.sum() + self.smooth)
+        intersection = (inputs_sigmoid * targets_flat).sum()
+        dice_score = (2. * intersection + self.smooth) / (inputs_sigmoid.sum() + targets_flat.sum() + self.smooth)
         return bce + (1 - dice_score)
 
 def l1_regularization(model: nn.Module, l1_lambda: float) -> torch.Tensor:
     return l1_lambda * sum(p.abs().sum() for p in model.parameters() if p.requires_grad)
 
-def dice_per_sample(preds, targets, smooth=1e-5):
-    inter = (preds * targets).sum((1,2,3))
-    denom = preds.sum((1,2,3)) + targets.sum((1,2,3))
-    return (2.*inter + smooth) / (denom + smooth)
+def dice_score(preds: torch.Tensor, targets: torch.Tensor, smooth: float = 1e-5) -> float:
+    preds_binary = (preds > 0.5).float()
+    intersection = (preds_binary * targets).sum(dim=(1,2,3))
+    union = preds_binary.sum(dim=(1,2,3)) + targets.sum(dim=(1,2,3))
+    return ((2. * intersection + smooth) / (union + smooth)).mean().item()
 
 # ----------------------------
-# Trainer with AMP and accumulation
+# Trainer Class
 # ----------------------------
 class Trainer:
     def __init__(self, model, optimizer, scheduler, criterion, device, train_loader, val_loader, args):
@@ -221,45 +428,31 @@ class Trainer:
         self.writer = SummaryWriter(log_dir=args.logdir)
         self.best_val_dice = 0.0
         self.pos_weight = torch.tensor([args.pos_weight], device=self.device)
-        self.scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
         os.makedirs(args.outdir, exist_ok=True)
 
     def _train_epoch(self, epoch: int):
         self.model.train()
         total_loss = 0.0
-        step = 0
         pbar = tqdm(self.train_loader, desc=f"Train E{epoch}/{self.args.epochs}")
-        accum_steps = max(1, self.args.accum_steps)
         for imgs, masks in pbar:
-            imgs = imgs.to(self.device); masks = masks.to(self.device)
+            imgs, masks = imgs.to(self.device), masks.to(self.device)
+
             self.optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=(self.scaler is not None)):
-                logits = self.model(imgs)
-                loss = self.criterion(logits, masks, pos_weight=self.pos_weight)
-                l1_penalty = l1_regularization(self.model, self.args.l1_lambda)
-                total_loss_batch = loss + l1_penalty
-                total_loss_batch = total_loss_batch / accum_steps
 
-            # backprop with scaler if available
-            if self.scaler is not None:
-                self.scaler.scale(total_loss_batch).backward()
-                if (step + 1) % accum_steps == 0:
-                    self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-            else:
-                total_loss_batch.backward()
-                if (step + 1) % accum_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.optimizer.step()
+            pred = self.model(imgs)
+            if isinstance(pred, tuple):  # Handle Connect-UNets output
+                pred = pred[0]
 
-            if (step + 1) % accum_steps == 0 and self.scaler is None:
-                self.optimizer.zero_grad()
+            loss = self.criterion(pred, masks, pos_weight=self.pos_weight)
+            l1_penalty = l1_regularization(self.model, self.args.l1_lambda)
+            total_loss_with_reg = loss + l1_penalty
+
+            total_loss_with_reg.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.optimizer.step()
 
             total_loss += loss.item()
-            step += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}", l1=f"{l1_penalty.item():.6f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}", l1=f"{l1_penalty.item():.4f}")
 
         avg_loss = total_loss / len(self.train_loader)
         self.writer.add_scalar("train/loss", avg_loss, epoch)
@@ -267,95 +460,116 @@ class Trainer:
 
     def _validate_epoch(self, epoch: int):
         self.model.eval()
-        val_loss = 0.0
-        val_dice = 0.0
+        val_loss, val_dice = 0, 0
+        pbar = tqdm(self.val_loader, desc=f"Val E{epoch}/{self.args.epochs}")
         with torch.no_grad():
-            pbar = tqdm(self.val_loader, desc=f"Val E{epoch}/{self.args.epochs}")
             for imgs, masks in pbar:
-                imgs = imgs.to(self.device); masks = masks.to(self.device)
-                logits = self.model(imgs)
-                loss = self.criterion(logits, masks, pos_weight=self.pos_weight)
+                imgs, masks = imgs.to(self.device), masks.to(self.device)
+
+                pred = self.model(imgs)
+                if isinstance(pred, tuple):
+                    pred = pred[0]
+
+                loss = self.criterion(pred, masks, pos_weight=self.pos_weight)
                 val_loss += loss.item()
-                probs = torch.sigmoid(logits)
-                val_dice += dice_per_sample(probs, masks).mean().item()
+
+                preds_sigmoid = torch.sigmoid(pred)
+                val_dice += dice_score(preds_sigmoid, masks)
                 pbar.set_postfix(dice=f"{val_dice / (pbar.n + 1):.4f}")
 
         avg_val_loss = val_loss / len(self.val_loader)
         avg_val_dice = val_dice / len(self.val_loader)
 
         self.scheduler.step(avg_val_dice)
+
         self.writer.add_scalar("val/loss", avg_val_loss, epoch)
         self.writer.add_scalar("val/dice", avg_val_dice, epoch)
         self.writer.add_scalar("lr", self.optimizer.param_groups[0]['lr'], epoch)
-
         print(f"Epoch {epoch} Val Loss: {avg_val_loss:.4f}, Val Dice: {avg_val_dice:.4f}")
 
-        # save best
         if avg_val_dice > self.best_val_dice:
             self.best_val_dice = avg_val_dice
             torch.save(self.model.state_dict(), os.path.join(self.args.outdir, "best.pth"))
-            print(f"New best model saved ({avg_val_dice:.4f})")
+            print(f"New best model saved with Dice: {self.best_val_dice:.4f}")
 
         torch.save(self.model.state_dict(), os.path.join(self.args.outdir, f"epoch_{epoch}.pth"))
+
         self._log_images(epoch)
 
     def _log_images(self, epoch: int):
-        if epoch % 3 != 0:
-            return
+        """Logs a random sample of validation predictions to TensorBoard."""
+        if epoch % 3 != 0: return
+
         imgs, masks = next(iter(self.val_loader))
-        idx = random.randint(0, imgs.size(0)-1)
-        img = imgs[idx:idx+1].to(self.device)
-        mask = masks[idx:idx+1]
+        idx = random.randint(0, imgs.size(0) - 1)
+        img, mask = imgs[idx:idx+1].to(self.device), masks[idx:idx+1]
+
         with torch.no_grad():
-            logits = self.model(img)
-            probs = torch.sigmoid(logits if not isinstance(logits, tuple) else logits[0])
-        def to_rgb(x):
-            return x.squeeze(0).cpu().repeat(3,1,1)
-        grid = torchvision.utils.make_grid([to_rgb(img.cpu()), to_rgb(mask), to_rgb((probs>0.5).float())],
-                                           nrow=3, normalize=True, scale_each=True)
+            pred_logits = self.model(img)
+            if isinstance(pred_logits, tuple):
+                pred_logits = pred_logits[0]
+            pred_prob = torch.sigmoid(pred_logits)
+
+        def to_rgb(x: torch.Tensor) -> torch.Tensor:
+            return x.squeeze(0).cpu().repeat(3, 1, 1)
+
+        grid = torchvision.utils.make_grid([
+            to_rgb(img.cpu()), to_rgb(mask), to_rgb((pred_prob > 0.5).float())
+        ], nrow=3, normalize=True, scale_each=True)
+
         self.writer.add_image("val/sample_prediction", grid, epoch)
 
     def run(self):
-        for epoch in range(1, self.args.epochs+1):
+        """Main training loop."""
+        for epoch in range(1, self.args.epochs + 1):
             self._train_epoch(epoch)
             self._validate_epoch(epoch)
         self.writer.close()
+        print("Training finished.")
 
 # ----------------------------
-# Utilities & main
+# Setup and Main Execution
 # ----------------------------
-def get_args():
-    p = argparse.ArgumentParser(description="Train ACA-Atrous-ResUNet on texture-enhanced single-channel images")
-    p.add_argument("--csv", type=str, required=True)
-    p.add_argument("--outdir", type=str, default="final_checkpoints")
-    p.add_argument("--logdir", type=str, default="runs/aca_resunet_75ep_improvised")
-    p.add_argument("--img-size", type=int, default=512)
-    p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--num-workers", type=int, default=4)
-    p.add_argument("--epochs", type=int, default=75)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--pos-weight", type=float, default=12.0)
-    p.add_argument("--l1-lambda", type=float, default=4.5e-4)
-    p.add_argument("--accum-steps", type=int, default=1, help="Gradient accumulation steps")
-    p.add_argument("--seed", type=int, default=32)
+def get_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train a segmentation model.")
+    p.add_argument("--csv", type=str, required=True, help="Path to the training CSV file.")
+    p.add_argument("--outdir", type=str, default="checkpoints", help="Directory to save model checkpoints.")
+    p.add_argument("--logdir", type=str, default="runs/segmentation_experiment", help="TensorBoard log directory.")
+
+    # Dataset and DataLoader
+    p.add_argument("--img-size", type=int, default=512, help="Image size for resizing.")
+    p.add_argument("--batch-size", type=int, default=8, help="Training batch size.")
+    p.add_argument("--num-workers", type=int, default=4, help="DataLoader num_workers.")
+
+    # Training Hyperparameters
+    p.add_argument("--epochs", type=int, default=75, help="Number of training epochs.")
+    p.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
+    p.add_argument("--pos-weight", type=float, default=12.0, help="Positive class weight for BCE loss.")
+    p.add_argument("--l1-lambda", type=float, default=4.5e-4, help="L1 regularization strength.")
+
+    # Model Selection
+    p.add_argument("--model", type=str, default="aca-atrous-resunet",
+                     choices=["aca-atrous-unet", "connect-unet", "smp-unet-resnet34", "aca-atrous-resunet"],
+                     help="Select the model architecture.")
+
+    p.add_argument("--check-masks", action="store_true",
+               help="Quickly save a few image+mask overlay PNGs to outdir/check_masks for visual inspection.")
+
     return p.parse_args()
 
-def seed_everything(seed: int = 32):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
+def setup_dataloaders(args: argparse.Namespace) -> Tuple[DataLoader, DataLoader]:
+    """Creates and splits dataset, and returns DataLoaders."""
+    dataset = BreastSegDataset(args.csv, resize=(args.img_size, args.img_size), augment=True)
+    val_len = int(len(dataset) * 0.2)
+    train_len = len(dataset) - val_len
+    train_ds, val_ds = random_split(dataset, [train_len, val_len])
 
-def setup_dataloaders(args):
-    ds = BreastSegDataset(args.csv, resize=(args.img_size, args.img_size), augment=True)
-    val_len = int(len(ds) * 0.2); train_len = len(ds) - val_len
-    tr, vl = random_split(ds, [train_len, val_len])
-
-    # robust image-level sampler (handles masks that might not exist or be empty)
+    # Weighted sampler for handling class imbalance at the image level
     df = pd.read_csv(args.csv)
-    train_mask_paths = [df.loc[i, "roi_mask_file_path"] for i in tr.indices]
-    class_labels=[]
-    for p in tqdm(train_mask_paths, desc="Preparing sampler"):
+    mask_paths = [df.loc[idx, "roi_mask_file_path"] for idx in train_ds.indices]
+
+    class_labels = []
+    for p in tqdm(mask_paths, desc="Reading masks for sampler"):
         try:
             m = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
             if m is None:
@@ -364,35 +578,72 @@ def setup_dataloaders(args):
                 class_labels.append(1 if m.sum() > 0 else 0)
         except Exception:
             class_labels.append(0)
-    counts = np.bincount(class_labels)
-    counts = np.where(counts==0, 1, counts)
-    class_weights = 1.0 / counts
-    sample_weights = [class_weights[l] for l in class_labels]
+
+    class_counts = np.bincount(class_labels)
+    class_counts = np.where(class_counts == 0, 1, class_counts)
+    class_weights = 1.0 / class_counts
+    sample_weights = [class_weights[label] for label in class_labels]
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
-    tr_loader = DataLoader(tr, batch_size=args.batch_size, sampler=sampler, num_workers=args.num_workers, pin_memory=True)
-    vl_loader = DataLoader(vl, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
-    return tr_loader, vl_loader
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, sampler=sampler,
+                              num_workers=args.num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                            num_workers=args.num_workers, pin_memory=True)
 
-def create_model(device):
-    model = ACAAtrousResUNet(in_ch=1, out_ch=1).to(device)
+    return train_loader, val_loader
+
+def create_model(model_name: str, device: torch.device, img_size: int) -> nn.Module:
+    """Instantiates the selected model and runs a dummy forward to init lazy modules."""
+    models: Dict[str, nn.Module] = {
+        "aca-atrous-unet": ACAAtrousUNet(in_ch=1, out_ch=1, base_ch=64),
+        "connect-unet": ConnectUNets(in_ch=1, out_ch=1, base_ch=64),
+        "smp-unet-resnet34": smp.Unet(encoder_name="resnet34", encoder_weights="imagenet", in_channels=1, classes=1),
+        "aca-atrous-resunet": ACAAtrousResUNet(in_ch=1, out_ch=1)
+    }
+    if model_name not in models:
+        raise ValueError(f"Unknown model name: {model_name}. Available models: {list(models.keys())}")
+
+    model = models[model_name].to(device)
+    # Run a dummy forward once to ensure any lazy-created modules register their parameters
+    try:
+        model.eval()
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, img_size, img_size, device=device)
+            _ = model(dummy)
+        model.train()
+    except Exception as e:
+        # don't crash — it's just a best-effort initializer. But print a helpful note.
+        print(f"[WARN] Dummy init forward failed: {e}; lazy modules (if any) may not be registered for optimizer.")
+    print(f"Using model: {model_name}")
     return model
 
 def main():
     args = get_args()
-    seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
+    print(f"Using device: {device}")
 
-    tr_loader, vl_loader = setup_dataloaders(args)
-    model = create_model(device)
+    train_loader, val_loader = setup_dataloaders(args)
 
+    # create model (dummy forward will run inside create_model to initialize lazy submodules)
+    model = create_model(args.model, device, img_size=args.img_size)
+
+    # now create optimizer (after dummy pass so optimizer sees all params)
     criterion = DiceBCELoss(smooth=1e-5)
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4, nesterov=True)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=5, verbose=True, min_lr=1e-6)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5, verbose=True, min_lr=1e-6
+    )
 
-    trainer = Trainer(model=model, optimizer=optimizer, scheduler=scheduler,
-                      criterion=criterion, device=device, train_loader=tr_loader, val_loader=vl_loader, args=args)
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        criterion=criterion,
+        device=device,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        args=args
+    )
     trainer.run()
 
 if __name__ == "__main__":
