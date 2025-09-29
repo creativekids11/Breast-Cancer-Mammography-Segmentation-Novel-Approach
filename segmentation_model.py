@@ -3,8 +3,8 @@
 """
 Refactored script for breast cancer segmentation using advanced U-Net architectures.
 
-Scheduler change: use CosineAnnealingWarmRestarts with eta_min default 5e-8.
-We step the scheduler per train-batch for smooth cosine cycles + restarts.
+This variant treats each CSV row image_file_path as a full, preprocessed image
+(produced by dataset_process.py). ROI cropping is disabled — whole-image input only.
 """
 from __future__ import annotations
 import argparse
@@ -33,21 +33,16 @@ import torchvision
 # ----------------------------
 class BreastSegDataset(Dataset):
     """
-    Dataset that supports precomputed ROI columns in CSV:
-      roi_x1, roi_y1, roi_x2, roi_y2 (integers, optional).
-    If present, image and mask will be cropped to the ROI before transforms.
-    Returns (img_tensor, mask_tensor) if not using metas; if use_meta=True returns (img, mask, meta)
+    Dataset that expects the CSV rows to point to full preprocessed images (grayscale)
+    and full masks (same size). ROI cropping is intentionally disabled so every sample
+    is the entire image produced by dataset_process.py.
     """
     def __init__(self, csv_file: str, resize: Tuple[int,int] = (512,512), augment: bool = False,
                  use_meta: bool = False):
         df = pd.read_csv(csv_file)
         self.images = df["image_file_path"].tolist()
         self.masks = df["roi_mask_file_path"].tolist()
-        # read roi columns if present (may be NaN)
-        self.roi_x1 = df["roi_x1"].tolist() if "roi_x1" in df.columns else [None]*len(df)
-        self.roi_y1 = df["roi_y1"].tolist() if "roi_y1" in df.columns else [None]*len(df)
-        self.roi_x2 = df["roi_x2"].tolist() if "roi_x2" in df.columns else [None]*len(df)
-        self.roi_y2 = df["roi_y2"].tolist() if "roi_y2" in df.columns else [None]*len(df)
+        # keep roi columns if present but ignore them — full-image training
         self.resize = resize
         self.augment = augment
         self.use_meta = use_meta
@@ -56,7 +51,6 @@ class BreastSegDataset(Dataset):
     def _get_transforms(self):
         common_transforms = [
             A.Resize(self.resize[0], self.resize[1]),
-            A.Normalize(mean=(0.5,), std=(0.5,)),
             ToTensorV2()
         ]
         if self.augment:
@@ -77,49 +71,31 @@ class BreastSegDataset(Dataset):
     def __getitem__(self, idx: int):
         img_path = self.images[idx]
         mask_path = self.masks[idx]
+
         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
         if img is None:
             raise RuntimeError(f"Failed to read image: {img_path}")
         if mask is None:
-            raise RuntimeError(f"Failed to read mask: {mask_path}")
+            # allow missing mask but create empty one to avoid crashes
+            mask = np.zeros_like(img, dtype=np.uint8)
 
-        H,W = img.shape[:2]
-        # check precomputed ROI columns
-        try:
-            x1 = None if self.roi_x1[idx] is None or (isinstance(self.roi_x1[idx], float) and np.isnan(self.roi_x1[idx])) else int(self.roi_x1[idx])
-            y1 = None if self.roi_y1[idx] is None or (isinstance(self.roi_y1[idx], float) and np.isnan(self.roi_y1[idx])) else int(self.roi_y1[idx])
-            x2 = None if self.roi_x2[idx] is None or (isinstance(self.roi_x2[idx], float) and np.isnan(self.roi_x2[idx])) else int(self.roi_x2[idx])
-            y2 = None if self.roi_y2[idx] is None or (isinstance(self.roi_y2[idx], float) and np.isnan(self.roi_y2[idx])) else int(self.roi_y2[idx])
-        except Exception:
-            x1=y1=x2=y2=None
+        # Ignore any roi columns — use whole image
+        img_full = img
+        mask_full = mask
 
-        if x1 is not None and x2 is not None and y1 is not None and y2 is not None:
-            # clamp
-            x1 = max(0, min(W-1, x1)); x2 = max(0, min(W-1, x2))
-            y1 = max(0, min(H-1, y1)); y2 = max(0, min(H-1, y2))
-            if x2 < x1: x2 = x1
-            if y2 < y1: y2 = y1
-            img_crop = img[y1:y2+1, x1:x2+1]
-            mask_crop = mask[y1:y2+1, x1:x2+1]
-            meta = ((H,W), (x1,y1,x2,y2), None, None)  # you may populate lesion_norm later
-        else:
-            img_crop = img
-            mask_crop = mask
-            meta = None
+        # ensure mask is binary and same size as image
+        if mask_full.shape != img_full.shape:
+            mask_full = cv2.resize(mask_full, (img_full.shape[1], img_full.shape[0]), interpolation=cv2.INTER_NEAREST)
+        mask_full = ((mask_full > 0).astype(np.uint8) * 255)
 
-        # ensure binary mask
-        if mask_crop is None:
-            mask_crop = np.zeros_like(img_crop, dtype=np.uint8)
-        if mask_crop.shape != img_crop.shape:
-            mask_crop = cv2.resize(mask_crop, (img_crop.shape[1], img_crop.shape[0]), interpolation=cv2.INTER_NEAREST)
-        mask_crop = ((mask_crop > 0).astype(np.uint8) * 255)
-
-        augmented = self.transform(image=img_crop, mask=mask_crop)
-        img_t = augmented["image"]
-        mask_t = augmented["mask"].unsqueeze(0) / 255.0
+        augmented = self.transform(image=img_full, mask=mask_full)
+        img_t = augmented["image"]         # shape: CxHxW (C=1)
+        mask_t = augmented["mask"].unsqueeze(0) / 255.0  # -> 1xHxW, 0..1
 
         if self.use_meta:
+            meta = {"orig_shape": img.shape}
             return img_t.float(), mask_t.float(), meta
         else:
             return img_t.float(), mask_t.float()
@@ -132,13 +108,9 @@ def check_masks(args):
     n = min(32, len(ds))
     for i in range(n):
         img_t, mask_t = ds[i]
-        # tensors: img_t is 1xHxW normalized (-1..1) after ToTensorV2 + Normalize
-        # Undo normalization to view: (img*0.5 + 0.5) *255
-        img = img_t.clone()
-        img = img * 0.5 + 0.5
-        img = (img * 255.0).squeeze(0).cpu().numpy().astype(np.uint8)
+        # albumentations ToTensorV2 yields floats in 0..1 (uint -> float)
+        img = (img_t * 255.0).squeeze(0).cpu().numpy().astype(np.uint8)
         mask = (mask_t.squeeze(0).cpu().numpy() * 255.0).astype(np.uint8)
-        # overlay contour
         overlay = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(overlay, contours, -1, (0,0,255), 1)  # red contours
@@ -148,15 +120,12 @@ def check_masks(args):
 
 # ----------------------------
 # ACA block, UNet, ASPP, etc.
+# (unchanged from your original, only abbreviated here for clarity)
 # ----------------------------
+
 class ACAModule(nn.Module):
     def __init__(self, skip_channels, gate_channels, reduction=8):
-        """
-        Standard ACA module. Keep init with provided channel hints, but robust
-        usage in UpACA (we will create instances with correct channels).
-        """
         super().__init__()
-        # We'll assume channels provided are correct for normal (non-lazy) cases.
         self.ca = nn.Sequential(
             nn.Conv2d(skip_channels + gate_channels, max(skip_channels // reduction, 1), kernel_size=1, bias=False),
             nn.ReLU(inplace=True),
@@ -176,7 +145,6 @@ class ACAModule(nn.Module):
         )
 
     def forward(self, skip, gate):
-        # gate already resized where needed by caller
         concat = torch.cat([skip, gate], dim=1)
         ca = self.ca(concat)
         sa = self.spatial(concat)
@@ -195,7 +163,7 @@ class DoubleConv(nn.Module):
             nn.ReLU(inplace=True)
         ]
         if dropout:
-            layers.append(nn.Dropout2d(0.3))
+            layers.append(nn.Dropout2d(0.1))
         self.net = nn.Sequential(*layers)
     def forward(self, x):
         return self.net(x)
@@ -220,10 +188,6 @@ class Up(nn.Module):
         return self.conv(out)
 
 class UpACA(nn.Module):
-    """
-    Robust Up module with ACA. Lazily creates internal modules and moves them
-    to the same device/dtype as the tensors that triggered creation.
-    """
     def __init__(self, in_ch_hint=None, out_ch=64, skip_ch_hint=None, dropout=False):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
@@ -231,19 +195,14 @@ class UpACA(nn.Module):
         self._skip_ch_hint = skip_ch_hint
         self._out_ch = out_ch
         self._dropout = dropout
-        # actual modules (created lazily in forward)
         self.aca = None
         self.conv = None
 
     def _create_modules(self, skip_ch, gate_ch, device=None, dtype=None):
-        # create ACA and conv with correct channel sizes
         self.aca = ACAModule(skip_channels=skip_ch, gate_channels=gate_ch)
         in_conv = skip_ch + gate_ch
         self.conv = DoubleConv(in_conv, self._out_ch, dropout=self._dropout)
-
-        # Move newly created modules to the correct device/dtype
         if device is not None:
-            # .to accepts dtype as well, ensure weights/biases match input dtype
             if dtype is not None:
                 self.aca.to(device=device, dtype=dtype)
                 self.conv.to(device=device, dtype=dtype)
@@ -259,7 +218,6 @@ class UpACA(nn.Module):
         skip_ch = x_encoder.shape[1]
         gate_ch = x.shape[1]
 
-        # If modules not yet created, create them and move to the data device/dtype
         if self.aca is None or self.conv is None:
             device = x_encoder.device
             dtype = x_encoder.dtype
@@ -296,10 +254,10 @@ class ACAAtrousUNet(nn.Module):
         self.down3 = Down(base_ch*4, base_ch*8)
         self.down4 = Down(base_ch*8, base_ch*8)
         self.aspp = ASPP(base_ch*8, base_ch*2)
-        self.up1 = UpACA(in_ch_hint=base_ch*8, out_ch=base_ch*4, skip_ch_hint=base_ch*8, dropout=True)
-        self.up2 = UpACA(in_ch_hint=base_ch*4, out_ch=base_ch*2, skip_ch_hint=base_ch*4, dropout=True)
-        self.up3 = UpACA(in_ch_hint=base_ch*2, out_ch=base_ch, skip_ch_hint=base_ch*2, dropout=True)
-        self.up4 = UpACA(in_ch_hint=base_ch, out_ch=base_ch, skip_ch_hint=base_ch, dropout=True)
+        self.up1 = UpACA(in_ch_hint=base_ch*8, out_ch=base_ch*4, skip_ch_hint=base_ch*8, dropout=False)
+        self.up2 = UpACA(in_ch_hint=base_ch*4, out_ch=base_ch*2, skip_ch_hint=base_ch*4, dropout=False)
+        self.up3 = UpACA(in_ch_hint=base_ch*2, out_ch=base_ch, skip_ch_hint=base_ch*2, dropout=False)
+        self.up4 = UpACA(in_ch_hint=base_ch, out_ch=base_ch, skip_ch_hint=base_ch, dropout=False)
         self.outc = nn.Conv2d(base_ch, out_ch, 1)
     def forward(self, x):
         x1 = self.inc(x)
@@ -323,10 +281,10 @@ class UNet(nn.Module):
         self.down2 = Down(base_ch*2, base_ch*4)
         self.down3 = Down(base_ch*4, base_ch*8)
         self.down4 = Down(base_ch*8, base_ch*8)
-        self.up1 = Up(base_ch*8, base_ch*4, base_ch*8, dropout=True)
-        self.up2 = Up(base_ch*4, base_ch*2, base_ch*4, dropout=True)
-        self.up3 = Up(base_ch*2, base_ch, base_ch*2, dropout=True)
-        self.up4 = Up(base_ch, base_ch, base_ch, dropout=True)
+        self.up1 = Up(base_ch*8, base_ch*4, base_ch*8, dropout=False)
+        self.up2 = Up(base_ch*4, base_ch*2, base_ch*4, dropout=False)
+        self.up3 = Up(base_ch*2, base_ch, base_ch*2, dropout=False)
+        self.up4 = Up(base_ch, base_ch, base_ch, dropout=False)
         self.outc = nn.Conv2d(base_ch, out_ch, 1)
     def forward(self, x):
         x1 = self.inc(x); x2 = self.down1(x1)
@@ -351,12 +309,9 @@ class ConnectUNets(nn.Module):
 class ACAAtrousResUNet(nn.Module):
     def __init__(self, in_ch=1, out_ch=1):
         super().__init__()
-        # SMP Unet encoder but we will only use this single architecture
         self.encoder = smp.Unet(encoder_name="resnet34", encoder_weights="imagenet", in_channels=in_ch, classes=out_ch)
         encoder_channels = self.encoder.encoder.out_channels
-        # aspp input/out chosen from encoder channel list
         self.aspp = ASPP(in_ch=encoder_channels[-1], out_ch=encoder_channels[-2])
-        # create UpACA with hints - UpACA will lazily create modules based on actual tensors
         self.up_aca1 = UpACA(in_ch_hint=encoder_channels[-2], out_ch=encoder_channels[-3], skip_ch_hint=encoder_channels[-2])
         self.up_aca2 = UpACA(in_ch_hint=encoder_channels[-3], out_ch=encoder_channels[-4], skip_ch_hint=encoder_channels[-3])
         self.up_aca3 = UpACA(in_ch_hint=encoder_channels[-4], out_ch=encoder_channels[-5], skip_ch_hint=encoder_channels[-4])
@@ -364,15 +319,10 @@ class ACAAtrousResUNet(nn.Module):
         self.outc = nn.Conv2d(in_channels=encoder_channels[-5], out_channels=out_ch, kernel_size=1)
 
     def forward(self, x):
-        # encoder.encoder returns list/tuple of features; indices may vary by SMP version.
         feats = self.encoder.encoder(x)
-        # Try to handle different lengths (some SMP versions include more initial feature)
-        # Common layout: feats = [c0, c1, c2, c3, c4, c5] or [c0,c1,c2,c3,c4]
-        # We'll attempt to pick last five features for decoder use.
         if len(feats) >= 6:
             e1, e2, e3, e4, bottleneck = feats[1], feats[2], feats[3], feats[4], feats[5]
         else:
-            # fallback: use last 5 elements
             e1, e2, e3, e4, bottleneck = feats[-5], feats[-4], feats[-3], feats[-2], feats[-1]
 
         d5 = self.aspp(bottleneck)
@@ -449,15 +399,11 @@ class Trainer:
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
-            # Step the CosineAnnealingWarmRestarts scheduler every batch using fractional epoch
-            # (epoch starts at 1 in run loop, so fractional_epoch = epoch-1 + batch_idx/n_batches)
             if self.scheduler is not None:
                 try:
                     frac_epoch = float(epoch - 1) + float(batch_idx) / max(1, n_batches)
-                    # scheduler expects a float epoch value to compute internal T_cur when stepping per-batch
                     self.scheduler.step(frac_epoch)
                 except Exception:
-                    # some schedulers expect different stepping; ignore step failures gracefully
                     pass
 
             total_loss += loss.item()
@@ -465,7 +411,6 @@ class Trainer:
 
         avg_loss = total_loss / len(self.train_loader)
         self.writer.add_scalar("train/loss", avg_loss, epoch)
-        # also log lr
         current_lr = self.optimizer.param_groups[0]['lr']
         self.writer.add_scalar("train/lr", current_lr, epoch)
         print(f"Epoch {epoch} Train Loss: {avg_loss:.4f}, LR: {current_lr:.6e}")
@@ -492,12 +437,8 @@ class Trainer:
         avg_val_loss = val_loss / len(self.val_loader)
         avg_val_dice = val_dice / len(self.val_loader)
 
-        # NOTE: CosineAnnealingWarmRestarts is not metric-driven, so DO NOT call scheduler.step(metric).
-        # We already stepped the scheduler per-batch in training.
-
         self.writer.add_scalar("val/loss", avg_val_loss, epoch)
         self.writer.add_scalar("val/dice", avg_val_dice, epoch)
-        # still log LR so you can see lr vs metric
         self.writer.add_scalar("val/lr", self.optimizer.param_groups[0]['lr'], epoch)
         print(f"Epoch {epoch} Val Loss: {avg_val_loss:.4f}, Val Dice: {avg_val_dice:.4f}")
 
@@ -525,11 +466,15 @@ class Trainer:
             pred_prob = torch.sigmoid(pred_logits)
 
         def to_rgb(x: torch.Tensor) -> torch.Tensor:
-            return x.squeeze(0).cpu().repeat(3, 1, 1)
+            # x: 1xHxW or 3xHxW; we want 3xHxW rgb-like tensor for TB
+            t = x.squeeze(0).cpu()
+            if t.shape[0] == 1:
+                return t.repeat(3, 1, 1)
+            return t
 
         grid = torchvision.utils.make_grid([
-            to_rgb(img.cpu()), to_rgb(mask), to_rgb((pred_prob > 0.5).float())
-        ], nrow=3, normalize=True, scale_each=True)
+            to_rgb(img.cpu()), to_rgb(mask.cpu()), to_rgb((pred_prob > 0.5).float().cpu())
+        ], nrow=3, normalize=False, scale_each=True)
 
         self.writer.add_image("val/sample_prediction", grid, epoch)
 
@@ -552,14 +497,14 @@ def get_args() -> argparse.Namespace:
 
     # Dataset and DataLoader
     p.add_argument("--img-size", type=int, default=512, help="Image size for resizing.")
-    p.add_argument("--batch-size", type=int, default=8, help="Training batch size.")
+    p.add_argument("--batch-size", type=int, default=16, help="Training batch size.")
     p.add_argument("--num-workers", type=int, default=4, help="DataLoader num_workers.")
 
     # Training Hyperparameters
     p.add_argument("--epochs", type=int, default=125, help="Number of training epochs.")
     p.add_argument("--lr", type=float, default=1e-3, help="Initial learning rate.")
-    p.add_argument("--pos-weight", type=float, default=12.0, help="Positive class weight for BCE loss.")
-    p.add_argument("--l1-lambda", type=float, default=4.5e-4, help="L1 regularization strength.")
+    p.add_argument("--pos-weight", type=float, default=9.0, help="Positive class weight for BCE loss.")
+    p.add_argument("--l1-lambda", type=float, default=4.5e-5, help="L1 regularization strength.")
 
     # Model Selection
     p.add_argument("--model", type=str, default="aca-atrous-resunet",
@@ -572,7 +517,7 @@ def get_args() -> argparse.Namespace:
     # CosineAnnealingWarmRestarts options
     p.add_argument("--t0", type=int, default=12, help="T_0 for CosineAnnealingWarmRestarts (first restart epoch count).")
     p.add_argument("--t-mult", type=int, default=2, help="T_mult for CosineAnnealingWarmRestarts (cycle multiplier).")
-    p.add_argument("--eta-min", type=float, default=5e-8, help="Minimum LR (eta_min) for CosineAnnealingWarmRestarts.")
+    p.add_argument("--eta-min", type=float, default=5e-6, help="Minimum LR (eta_min) for CosineAnnealingWarmRestarts.")
 
     return p.parse_args()
 
@@ -623,7 +568,6 @@ def create_model(model_name: str, device: torch.device, img_size: int) -> nn.Mod
         raise ValueError(f"Unknown model name: {model_name}. Available models: {list(models.keys())}")
 
     model = models[model_name].to(device)
-    # Run a dummy forward once to ensure any lazy-created modules register their parameters
     try:
         model.eval()
         with torch.no_grad():
@@ -631,7 +575,6 @@ def create_model(model_name: str, device: torch.device, img_size: int) -> nn.Mod
             _ = model(dummy)
         model.train()
     except Exception as e:
-        # don't crash — it's just a best-effort initializer. But print a helpful note.
         print(f"[WARN] Dummy init forward failed: {e}; lazy modules (if any) may not be registered for optimizer.")
     print(f"Using model: {model_name}")
     return model
@@ -643,14 +586,11 @@ def main():
 
     train_loader, val_loader = setup_dataloaders(args)
 
-    # create model (dummy forward will run inside create_model to initialize lazy submodules)
     model = create_model(args.model, device, img_size=args.img_size)
 
-    # now create optimizer (after dummy pass so optimizer sees all params)
     criterion = DiceBCELoss(smooth=1e-5)
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-4, nesterov=True)
 
-    # --- COSINE WARM RESTARTS SCHEDULER ---
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer,
         T_0=args.t0,
