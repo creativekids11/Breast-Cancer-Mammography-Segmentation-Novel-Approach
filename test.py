@@ -10,7 +10,6 @@ Minimal dependencies: torch, numpy, pandas, opencv (cv2).
 
 import os
 import argparse
-# import math
 import traceback
 import numpy as np
 import pandas as pd
